@@ -1,0 +1,201 @@
+diff --git a/scratch/oran_xapp/_common/scenario_lib.h b/scratch/oran_xapp/_common/scenario_lib.h
+index bb734c317..943128b8c 100644
+--- a/scratch/oran_xapp/_common/scenario_lib.h
++++ b/scratch/oran_xapp/_common/scenario_lib.h
+@@ -45,6 +45,7 @@
+ #include "metrics_dump.h"
+ 
+ #include <chrono>
++#include <atomic>
+ #include <fstream>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -205,6 +206,9 @@ struct ScenarioConfig {
+     // Use-case assignment hook — per-UE type code.
+     // Default: alternating mix tuned per scenario in the .cc files.
+     std::function<int(int)> assignUseCase;
++    bool allowAdaptiveStudy = false;
++    bool adaptiveStudy = false;
++    double studySensorUlMbps = 0.0;
+ 
+     // Per-UE traffic generation defaults (the active profile may further cap
+     // the background flows; see ApplyArrivalCap below).
+@@ -265,6 +269,7 @@ private:
+     double GetRlcQueueSize(const Ptr<NrRlc>& rlc);
+     void UpdateSlackMetrics(int ueIndex, double latencyMs, bool isUl);
+     void CalculateFlowMetrics();
++    TrafficSpec GetRunTrafficSpec(int useCase) const;
+ 
+     void ReportSinr(std::string ctx, uint16_t cellId, uint16_t rnti,
+                     double sinr, uint16_t bwpId);
+@@ -289,6 +294,7 @@ private:
+ 
+     // -- Members ----------------------------------------------------------
+     ScenarioConfig m_cfg;
++    std::string m_studyTddPattern;
+     uint32_t m_simTime;
+     std::string m_outDir;
+     std::string m_shmPrefix;
+@@ -771,7 +777,7 @@ inline void ScenarioRunner::PopulateState(int step) {
+ 
+     auto* state = m_shm->GetCpp2PyStruct();
+     state->nodeId = 9999;
+-    state->stepCount = step;
++    if (!m_cfg.adaptiveStudy) state->stepCount = step;
+     state->numUes = m_cfg.ueNum;
+     state->numQuarantined = m_lastQuarantineCount;
+     for (int i = 0; i < m_cfg.ueNum; ++i)
+@@ -916,6 +922,10 @@ inline void ScenarioRunner::PopulateState(int step) {
+     state->servedUes = m_cfg.ueNum;
+     state->handovers = (int32_t)m_handoverCount;
+     for (int k = 0; k < 5; ++k) state->weightHistogram[k] = 0;
++    if (m_cfg.adaptiveStudy) {
++        std::atomic_thread_fence(std::memory_order_release);
++        *static_cast<volatile int32_t*>(&state->stepCount) = step;
++    }
+ }
+ 
+ // ----- Apply control template -------------------------------------------
+@@ -1178,11 +1188,37 @@ inline void ScenarioRunner::ParseCommandLine(int argc, char* argv[]) {
+     uint32_t simTime = (uint32_t)m_cfg.simTimeSeconds;
+     CommandLine cmd;
+     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
++    std::string studyTrace;
++    if (m_cfg.allowAdaptiveStudy) {
++        cmd.AddValue("adaptiveStudy", "Enable Adaptive LLM study settings and logging", m_cfg.adaptiveStudy);
++        cmd.AddValue("studyMobility", "Adaptive LLM study mobility trace", studyTrace);
++        cmd.AddValue("studySensorUlMbps", "Aggregate Sensor UL payload rate in Mbps (0 = original)", m_cfg.studySensorUlMbps);
++    }
+     cmd.Parse(argc, argv);
++    NS_ABORT_MSG_IF(!std::isfinite(m_cfg.studySensorUlMbps) || m_cfg.studySensorUlMbps < 0,
++                    "Study background rate must be finite and nonnegative");
++    NS_ABORT_MSG_IF(!m_cfg.adaptiveStudy && (!studyTrace.empty() || m_cfg.studySensorUlMbps != 0),
++                    "Study mobility and background rate require adaptiveStudy");
++    if (!studyTrace.empty()) m_cfg.ns2TraceFile = studyTrace;
+     m_simTime = simTime;
+     m_cfg.simTimeSeconds = (double)simTime;
+ }
+ 
++inline TrafficSpec ScenarioRunner::GetRunTrafficSpec(int useCase) const {
++    TrafficSpec spec = GetTrafficSpec(useCase);
++    if (useCase == UC_RTSA && m_cfg.studySensorUlMbps > 0) {
++        int sensors = 0;
++        for (int ue = 0; ue < m_cfg.ueNum; ++ue) {
++            sensors += m_cfg.assignUseCase(ue) == UC_RTSA;
++        }
++        NS_ABORT_MSG_IF(sensors == 0, "Study background UL override requires Sensor UEs");
++        spec.ul_mbps_target = m_cfg.studySensorUlMbps / sensors;
++        spec.ul_iv = Seconds(spec.ul_pkt * 8.0 / (spec.ul_mbps_target * 1e6));
++        NS_ABORT_MSG_IF(spec.ul_iv.IsZero(), "Study background interval is below time resolution");
++    }
++    return spec;
++}
++
+ // ----- End-of-sim --------------------------------------------------------
+ inline void ScenarioRunner::EndOfSimDump() {
+     if (m_netMetricsFile.is_open()) m_netMetricsFile.close();
+@@ -1237,7 +1273,7 @@ inline void ScenarioRunner::PrintStartupBanner() {
+         {"HDM", UC_HDM}, {"AIC", UC_AIC}, {"ToD", UC_TOD}, {"RTSA", UC_RTSA}};
+     for (const auto& [name, uc] : order) {
+         int n = mix[name];
+-        TrafficSpec spec = GetTrafficSpec(uc);
++        TrafficSpec spec = GetRunTrafficSpec(uc);
+         double dl = n * spec.dl_mbps_target;
+         double ul = n * spec.ul_mbps_target;
+         dlSum += dl;
+@@ -1347,6 +1383,16 @@ inline void ScenarioRunner::WriteRunConfigJson() {
+     f << "  \"warmup_s\": " << m_cfg.warmupTime.GetSeconds() << ",\n";
+     f << "  \"ai_cycle_ms\": " << m_cfg.aiCyclePeriod.GetMilliSeconds() << ",\n";
+     f << "  \"use_shm\": " << (m_cfg.useShm ? "true" : "false") << ",\n";
++    if (m_cfg.adaptiveStudy) {
++        f << "  \"ai_start_s\": " << m_cfg.aiCycleStartAt.GetSeconds() << ",\n";
++        f << "  \"radio\": {\"carrier_hz\": 4000000000, \"bandwidth_hz\": 100000000, "
++          << "\"numerology\": 1, \"gnb_tx_dbm\": 49, \"ue_tx_dbm\": 33, "
++          << "\"channel\": \"3GPP UMa Default\", \"scheduler\": \"NrMacSchedulerTdmaQos\", "
++          << "\"tdd_pattern\": \"" << m_studyTddPattern << "\", \"gnb_xyz_m\": [";
++        const auto& gnb = m_cfg.gnbPositions.front();
++        f << gnb.x << ", " << gnb.y << ", " << gnb.z
++          << "], \"rlc_um_buffer_bytes\": 100000000},\n";
++    }
+     f << "  \"ns2_trace_file\": \"" << m_cfg.ns2TraceFile << "\",\n";
+     f << "  \"class_mix\": {";
+     bool first = true;
+@@ -1360,7 +1406,7 @@ inline void ScenarioRunner::WriteRunConfigJson() {
+     f << "  \"traffic_spec\": {\n";
+     for (auto& [name, uc] : (std::vector<std::pair<std::string,int>>{
+             {"HDM", UC_HDM}, {"AIC", UC_AIC}, {"ToD", UC_TOD}, {"RTSA", UC_RTSA}})) {
+-        TrafficSpec sp = GetTrafficSpec(uc);
++        TrafficSpec sp = GetRunTrafficSpec(uc);
+         f << "    \"" << name << "\": {"
+           << "\"dl_pkt\": " << sp.dl_pkt
+           << ", \"dl_iv_us\": " << sp.dl_iv.GetMicroSeconds()
+@@ -1398,7 +1444,9 @@ inline void ScenarioRunner::WriteClassReportCsv() {
+     if (!f.is_open()) return;
+     f << "class,use_case,direction,tx_pkts,rx_pkts,pdr,deadline_miss_pct,"
+       << "deadline_met_ratio,p50_ms,p95_ms,p99_ms,mean_ms,"
+-      << "mbps_delivered\n";
++      << "mbps_delivered";
++    if (m_cfg.adaptiveStudy) f << ",deadline_met_pkts";
++    f << "\n";
+ 
+     // Order: AIC (C1), ToD (C2), HDM (C3), RTSA (C4) — same as paper Section 2.
+     static const int kIdxOrder[4] = {1, 2, 0, 3}; // AIC,ToD,HDM,RTSA → arr idx
+@@ -1425,7 +1473,9 @@ inline void ScenarioRunner::WriteClassReportCsv() {
+               << std::setprecision(2) << acc.percentile(0.50) << ","
+               << acc.percentile(0.95) << "," << acc.percentile(0.99) << ","
+               << acc.meanMs() << ","
+-              << std::setprecision(3) << mbps << "\n";
++              << std::setprecision(3) << mbps;
++            if (m_cfg.adaptiveStudy) f << "," << rx - acc.deadlineMissed;
++            f << "\n";
+         }
+     }
+     // Echo to stdout
+@@ -1648,6 +1698,7 @@ inline int ScenarioRunner::Run(int argc, char* argv[]) {
+     rs += nrHelper->AssignStreams(ueDev, rs);
+ 
+     nrHelper->GetGnbPhy(gnbDev.Get(0), 0)->SetAttribute("TxPower", DoubleValue(49));
++    if (m_cfg.adaptiveStudy) m_studyTddPattern = nrHelper->GetGnbPhy(gnbDev.Get(0), 0)->GetPattern();
+     for (uint32_t j = 0; j < m_ueNodes.GetN(); ++j) {
+         nrHelper->GetUePhy(ueDev.Get(j), 0)->SetAttribute("TxPower", DoubleValue(33));
+     }
+@@ -1710,7 +1761,7 @@ inline int ScenarioRunner::Run(int argc, char* argv[]) {
+         servers.Add(sinkApp);
+ 
+         int uc = m_useCaseType[j];
+-        TrafficSpec spec = GetTrafficSpec(uc);
++        TrafficSpec spec = GetRunTrafficSpec(uc);
+         // Per-direction MaxPackets so the 16 Mbps streams don't truncate.
+         uint32_t maxPktsDl = (uint32_t)std::max(1.0,
+             activeSec / spec.dl_iv.GetSeconds());
+diff --git a/scratch/oran_xapp/tools/shm_interface.py b/scratch/oran_xapp/tools/shm_interface.py
+index 9c2d32254..8c4b68f74 100644
+--- a/scratch/oran_xapp/tools/shm_interface.py
++++ b/scratch/oran_xapp/tools/shm_interface.py
+@@ -189,7 +189,8 @@ class SharedMemoryInterface:
+                      dl_weights: list[int] | None = None,
+                      applied_critical_weight: float = 1.0,
+                      applied_background_weight: float = 1.0,
+-                     applied_background_cap: float = 1.0) -> None:
++                     applied_background_cap: float = 1.0,
++                     publish_step_last: bool = False) -> None:
+         """Write a complete XAppAction to SHM.
+ 
+         The applied_* triple is the rApp-resolved control template — read
+@@ -212,8 +213,14 @@ class SharedMemoryInterface:
+         act.appliedCriticalWeight = float(applied_critical_weight)
+         act.appliedBackgroundWeight = float(applied_background_weight)
+         act.appliedBackgroundCap = float(applied_background_cap)
+-        self.handle.seek(self.off_action)
+-        self.handle.write(bytearray(act))
++        data = bytes(act)
++        offset = self.off_action
++        if publish_step_last:
++            self.handle[offset:offset + 4] = data[:4]
++            self.handle[offset + 8:offset + len(data)] = data[8:]
++            self.handle[offset + 4:offset + 8] = data[4:8]
++        else:
++            self.handle[offset:offset + len(data)] = data
+ 
+     def close(self) -> None:
+         try:

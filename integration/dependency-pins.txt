@@ -1,0 +1,16 @@
+Recorded software and input pins for the Adaptive LLM cohort and refresh-disabled ablation.
+
+ns-3-dev commit: 9351c3900d4e1c17ca0cc672ee7e6ec29427b48a
+NR commit:       caa74aa18acd73bad5c7c7fa2b4ac59fec22020e
+ns3-ai commit:   b8c9858294b1d6a7f122b5154a3ce25057a54740
+
+Ollama model: qwen2.5:7b
+Ollama digest: 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e
+Generation options: temperature=0.1, num_predict=900
+
+Input trace SHA-256:
+bc4cd5ca0195f47a9265e7189fc252bbc1cc8085010f1614bdfa02aa3c724145  mobility_inputs/ns2manhattanmobility20.tcl
+8a95480aed09639541ccc0cb822fd55cfdc42733d3880945c4fe6f9b728b4f9c  mobility_inputs/ns2manhattanmobility25.tcl
+1cd7be8a4ad52cab8b46c812b7828c39108c8d758dcd93e1ca1bc927341149e4  mobility_inputs/ns2manhattanmobility30.tcl
+
+The integration patch is against the ns-3-dev commit listed above.

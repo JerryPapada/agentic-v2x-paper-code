@@ -1,0 +1,8 @@
+/results/
+/.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+campaign.lock
+.DS_Store
